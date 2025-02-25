@@ -4,275 +4,180 @@ import time
 import re
 import requests
 import subprocess
-import threading
+import signal
 from datetime import datetime
 
-class MinecraftBedrockMonitor:
-    def __init__(self):
-        # Get credentials from environment variables
-        self.telegram_bot_token = os.environ.get("TELEGRAM_BOT_TOKEN")
-        self.telegram_chat_id = os.environ.get("TELEGRAM_CHAT_ID")
-        
-        # Check if we have valid credentials
-        self.notifications_enabled = (
-            self.telegram_bot_token is not None and 
-            self.telegram_chat_id is not None and
-            self.telegram_bot_token != "" and
-            self.telegram_chat_id != ""
-        )
-        
-        if not self.notifications_enabled:
-            print("Warning: Telegram credentials not found in environment variables.")
-            print("Notifications will be disabled.")
-        
-        self.server_process = None
-        self.log_thread = None
-        self.running = False
-        
-        # Configure paths
-        self.minecraft_bedrock_server_path = "/home/ubuntu/minecraft-bedrock"
-        self.bedrock_server_executable = "./bedrock_server"
-        self.log_file_path = os.path.join(self.minecraft_bedrock_server_path, "server.log")
+# Configuration - Read from environment variables
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
+SERVER_LOG_PATH = "/home/ubuntu/minecraft-bedrock/log.txt"
+POLL_INTERVAL = 1  # seconds between checks
 
-    def start_server_with_logging(self):
-        """Start the Minecraft Bedrock server with output redirection to a log file."""
-        try:
-            # Change to the server directory
-            os.chdir(self.minecraft_bedrock_server_path)
-            
-            # Create or truncate the log file
-            with open(self.log_file_path, 'w') as log_file:
-                pass
-                
-            # Start the server process with output redirection
-            self.server_process = subprocess.Popen(
-                self.bedrock_server_executable,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                universal_newlines=True,
-                bufsize=1
-            )
-            
-            print(f"Started Minecraft Bedrock server with PID: {self.server_process.pid}")
-            self.running = True
-            
-            # Start a thread to monitor the server output
-            self.log_thread = threading.Thread(target=self.monitor_server_output)
-            self.log_thread.daemon = True
-            self.log_thread.start()
-            
-            return True
-        except Exception as e:
-            print(f"Error starting Minecraft server: {e}")
-            return False
+# Check if Telegram configuration is available
+if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+    print("Warning: Telegram credentials not found in environment variables.")
+    print("Notifications will be disabled.")
+    NOTIFICATIONS_ENABLED = False
+else:
+    NOTIFICATIONS_ENABLED = True
+
+def send_telegram_message(message):
+    """Send message to Telegram chat using environment variables."""
+    if not NOTIFICATIONS_ENABLED:
+        print(f"Message not sent (notifications disabled): {message}")
+        return
+        
+    api_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    data = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": message,
+        "parse_mode": "HTML"
+    }
     
-    def monitor_server_output(self):
-        """Monitor the server's output for player connections."""
+    try:
+        response = requests.post(api_url, data=data)
+        if response.status_code != 200:
+            print(f"Failed to send Telegram message: {response.text}")
+        else:
+            print(f"Notification sent: {message}")
+    except Exception as e:
+        print(f"Error sending Telegram message: {e}")
+
+def setup_log_redirection():
+    """Set up redirection of Bedrock server output to our log file."""
+    # Check if the server is running through a start_server.sh script
+    server_pid = None
+    try:
+        # Look for bedrock_server process
+        output = subprocess.check_output(["pgrep", "-f", "bedrock_server"], universal_newlines=True)
+        server_pid = output.strip()
+        print(f"Found existing Minecraft server process: {server_pid}")
+    except subprocess.CalledProcessError:
+        print("No running Minecraft server found.")
+    
+    # Create or truncate the log file
+    with open(SERVER_LOG_PATH, 'w') as f:
+        pass
+    
+    # Check if we can access the server's standard output via its parent process
+    if server_pid:
+        print("Setting up log redirection...")
         try:
-            # Patterns for Bedrock server player connections and disconnections
-            player_join_pattern = r"Player connected: (.*?),"
-            player_leave_pattern = r"Player disconnected: (.*?),"
+            # This is a bit hacky but can work in some configurations
+            # Create a small script to redirect output
+            redirect_script = """#!/bin/bash
+tail -f /proc/$(pgrep -f bedrock_server)/fd/1 >> {log_file} &
+tail -f /proc/$(pgrep -f bedrock_server)/fd/2 >> {log_file} &
+""".format(log_file=SERVER_LOG_PATH)
             
-            with open(self.log_file_path, 'a') as log_file:
-                for line in iter(self.server_process.stdout.readline, ''):
-                    # Write to the log file
-                    timestamp = datetime.now().strftime('[%Y-%m-%d %H:%M:%S]')
-                    log_file.write(f"{timestamp} {line}")
-                    log_file.flush()
+            # Write and execute the script
+            with open("/tmp/redirect_minecraft.sh", "w") as f:
+                f.write(redirect_script)
+            
+            subprocess.call(["chmod", "+x", "/tmp/redirect_minecraft.sh"])
+            subprocess.Popen(["/tmp/redirect_minecraft.sh"], shell=True)
+            
+            print("Log redirection set up successfully.")
+        except Exception as e:
+            print(f"Failed to set up log redirection: {e}")
+
+def monitor_server_log():
+    """Monitor the log file for player connections."""
+    print(f"Starting to monitor log file: {SERVER_LOG_PATH}")
+    send_telegram_message("🎮 Minecraft server notification system is now active!")
+    
+    # Create the log file if it doesn't exist
+    if not os.path.exists(SERVER_LOG_PATH):
+        open(SERVER_LOG_PATH, 'a').close()
+        print(f"Created log file: {SERVER_LOG_PATH}")
+    
+    # Start from the end of the file
+    file_size = os.path.getsize(SERVER_LOG_PATH)
+    
+    # Precompile regular expressions for better performance
+    # Pattern for Bedrock server player connections and disconnections
+    player_join_pattern = re.compile(r"Player connected: (.*?)(?:,|$)")
+    player_leave_pattern = re.compile(r"Player disconnected: (.*?)(?:,|$)")
+    
+    try:
+        while True:
+            # Check if file size has changed
+            current_size = os.path.getsize(SERVER_LOG_PATH)
+            
+            if current_size > file_size:
+                with open(SERVER_LOG_PATH, 'r') as f:
+                    # Move to the position we last read
+                    f.seek(file_size)
+                    
+                    # Read new content
+                    new_content = f.read()
                     
                     # Check for player connections
-                    join_match = re.search(player_join_pattern, line)
-                    if join_match:
-                        player_name = join_match.group(1)
-                        self.send_telegram_message(f"🎮 Player {player_name} has joined the Minecraft server!")
+                    for match in player_join_pattern.finditer(new_content):
+                        player_name = match.group(1)
+                        send_telegram_message(f"🎮 Player {player_name} has joined the Minecraft server!")
                     
                     # Check for player disconnections
-                    leave_match = re.search(player_leave_pattern, line)
-                    if leave_match:
-                        player_name = leave_match.group(1)
-                        self.send_telegram_message(f"👋 Player {player_name} has left the Minecraft server")
-                    
-                    # Print to console for debugging
-                    print(line.strip())
-                    
-            print("Server process has ended")
-            self.running = False
-        
-        except Exception as e:
-            print(f"Error in output monitoring: {e}")
-            self.running = False
-    
-    def send_telegram_message(self, message):
-        """Send message to Telegram chat using environment variables."""
-        if not self.notifications_enabled:
-            print(f"Message not sent (notifications disabled): {message}")
-            return
-            
-        api_url = f"https://api.telegram.org/bot{self.telegram_bot_token}/sendMessage"
-        data = {
-            "chat_id": self.telegram_chat_id,
-            "text": message,
-            "parse_mode": "HTML"
-        }
-        
-        try:
-            response = requests.post(api_url, data=data)
-            if response.status_code != 200:
-                print(f"Failed to send Telegram message: {response.text}")
-            else:
-                print(f"Notification sent: {message}")
-        except Exception as e:
-            print(f"Error sending Telegram message: {e}")
-    
-    def stop_server(self):
-        """Stop the Minecraft server gracefully."""
-        if self.server_process:
-            print("Stopping Minecraft server...")
-            self.server_process.terminate()
-            self.server_process.wait(timeout=30)
-            self.running = False
-            print("Minecraft server stopped")
-
-class StandaloneMonitor:
-    """A standalone monitor that doesn't start/stop the server but only watches the log file."""
-    
-    def __init__(self):
-        # Get credentials from environment variables
-        self.telegram_bot_token = os.environ.get("TELEGRAM_BOT_TOKEN")
-        self.telegram_chat_id = os.environ.get("TELEGRAM_CHAT_ID")
-        
-        # Check if we have valid credentials
-        self.notifications_enabled = (
-            self.telegram_bot_token is not None and 
-            self.telegram_chat_id is not None and
-            self.telegram_bot_token != "" and
-            self.telegram_chat_id != ""
-        )
-        
-        if not self.notifications_enabled:
-            print("Warning: Telegram credentials not found in environment variables.")
-            print("Notifications will be disabled.")
-        
-        self.running = False
-        self.last_position = 0
-        
-        # Configure paths
-        self.log_file_path = "/home/ubuntu/minecraft-bedrock/server.log"
-    
-    def start_monitoring(self):
-        """Start monitoring an existing log file."""
-        self.running = True
-        
-        # Check if the log file exists
-        if not os.path.exists(self.log_file_path):
-            print(f"Log file not found at: {self.log_file_path}")
-            print("Creating an empty log file. Make sure your server writes to this location.")
-            with open(self.log_file_path, 'w') as f:
-                pass
-        
-        # Get the current file size
-        self.last_position = os.path.getsize(self.log_file_path)
-        
-        print(f"Starting to monitor log file: {self.log_file_path}")
-        print(f"Starting from position: {self.last_position}")
-        
-        try:
-            while self.running:
-                if os.path.exists(self.log_file_path):
-                    current_size = os.path.getsize(self.log_file_path)
-                    
-                    if current_size > self.last_position:
-                        with open(self.log_file_path, 'r') as file:
-                            file.seek(self.last_position)
-                            new_content = file.read()
-                            self.last_position = file.tell()
-                            
-                            # Check for player connections
-                            player_join_pattern = r"Player connected: (.*?),"
-                            join_matches = re.finditer(player_join_pattern, new_content)
-                            
-                            for match in join_matches:
-                                player_name = match.group(1)
-                                self.send_telegram_message(f"🎮 Player {player_name} has joined the Minecraft server!")
-                            
-                            # Check for player disconnections
-                            player_leave_pattern = r"Player disconnected: (.*?),"
-                            leave_matches = re.finditer(player_leave_pattern, new_content)
-                            
-                            for match in leave_matches:
-                                player_name = match.group(1)
-                                self.send_telegram_message(f"👋 Player {player_name} has left the Minecraft server")
+                    for match in player_leave_pattern.finditer(new_content):
+                        player_name = match.group(1)
+                        send_telegram_message(f"👋 Player {player_name} has left the Minecraft server")
                 
-                time.sleep(1)
-        
-        except KeyboardInterrupt:
-            print("Monitoring stopped by user")
-        except Exception as e:
-            print(f"Error monitoring log file: {e}")
-        finally:
-            self.running = False
-    
-    def send_telegram_message(self, message):
-        """Send message to Telegram chat using environment variables."""
-        if not self.notifications_enabled:
-            print(f"Message not sent (notifications disabled): {message}")
-            return
+                # Update the file position
+                file_size = current_size
             
-        api_url = f"https://api.telegram.org/bot{self.telegram_bot_token}/sendMessage"
-        data = {
-            "chat_id": self.telegram_chat_id,
-            "text": message,
-            "parse_mode": "HTML"
-        }
-        
-        try:
-            response = requests.post(api_url, data=data)
-            if response.status_code != 200:
-                print(f"Failed to send Telegram message: {response.text}")
-            else:
-                print(f"Notification sent: {message}")
-        except Exception as e:
-            print(f"Error sending Telegram message: {e}")
+            # Also check directly with server's process
+            try:
+                # This directly checks server output
+                server_check = subprocess.run(
+                    ["grep", "-E", "Player (connected|disconnected)", "/proc/$(pgrep -f bedrock_server)/fd/1"],
+                    shell=True, capture_output=True, text=True
+                )
+                if server_check.stdout:
+                    for line in server_check.stdout.splitlines():
+                        # Processing direct server output
+                        join_match = player_join_pattern.search(line)
+                        if join_match:
+                            player_name = join_match.group(1)
+                            send_telegram_message(f"🎮 Player {player_name} has joined the Minecraft server!")
+                            
+                        leave_match = player_leave_pattern.search(line)
+                        if leave_match:
+                            player_name = leave_match.group(1)
+                            send_telegram_message(f"👋 Player {player_name} has left the Minecraft server")
+            except Exception as e:
+                # Ignore errors in direct server output check
+                pass
+            
+            # Wait before checking again
+            time.sleep(POLL_INTERVAL)
     
-    def stop_monitoring(self):
-        """Stop the monitoring process."""
-        self.running = False
-        print("Monitoring stopped")
+    except KeyboardInterrupt:
+        print("Monitoring stopped by user.")
+        send_telegram_message("🛑 Minecraft server notification system has been stopped.")
+    except Exception as e:
+        error_message = f"Error in monitoring: {e}"
+        print(error_message)
+        send_telegram_message(f"⚠️ {error_message}")
+        raise
 
 def main():
     print("Minecraft Bedrock Server Telegram Notifier")
     print("------------------------------------------")
-    print("1. Start server with monitoring (will restart your server)")
-    print("2. Monitor existing server (use if server is already running)")
-    choice = input("Choose an option (1 or 2): ")
     
-    try:
-        if choice == "1":
-            # Integrated mode
-            monitor = MinecraftBedrockMonitor()
-            if monitor.start_server_with_logging():
-                print("Server started with monitoring. Press Ctrl+C to stop.")
-                
-                try:
-                    # Keep the main thread alive
-                    while monitor.running:
-                        time.sleep(1)
-                except KeyboardInterrupt:
-                    print("Stopping...")
-                finally:
-                    monitor.stop_server()
-            
-        elif choice == "2":
-            # Standalone monitoring mode
-            monitor = StandaloneMonitor()
-            print("Starting monitoring. Press Ctrl+C to stop.")
-            monitor.start_monitoring()
-            
-        else:
-            print("Invalid choice. Please run the script again.")
+    # Try to set up log redirection
+    setup_log_redirection()
     
-    except KeyboardInterrupt:
-        print("Program terminated by user")
+    # Begin monitoring
+    monitor_server_log()
 
 if __name__ == "__main__":
+    # Register signal handlers
+    def handle_exit(signum, frame):
+        print(f"Received signal {signum}, shutting down...")
+        send_telegram_message("🛑 Minecraft server notification system has been stopped.")
+        exit(0)
+    
+    signal.signal(signal.SIGTERM, handle_exit)
+    signal.signal(signal.SIGINT, handle_exit)
+    
     main()
