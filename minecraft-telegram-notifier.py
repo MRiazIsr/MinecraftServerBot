@@ -10,7 +10,7 @@ from datetime import datetime
 # Configuration - Read from environment variables
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
-SERVER_LOG_PATH = "/home/ubuntu/minecraft-bedrock/log.txt"
+SERVER_LOG_PATH = "/home/ubuntu/minecraft-bedrock/log.txt"  # This is the actual log file found on your server
 POLL_INTERVAL = 1  # seconds between checks
 
 # Check if Telegram configuration is available
@@ -43,110 +43,110 @@ def send_telegram_message(message):
     except Exception as e:
         print(f"Error sending Telegram message: {e}")
 
-def setup_log_redirection():
-    """Set up redirection of Bedrock server output to our log file."""
-    # Check if the server is running through a start_server.sh script
-    server_pid = None
+def check_log_file():
+    """Check if the log file exists and is accessible."""
+    if not os.path.exists(SERVER_LOG_PATH):
+        print(f"Warning: Log file {SERVER_LOG_PATH} does not exist.")
+        print("Creating an empty log file for monitoring.")
+        try:
+            # Try to create the file if it doesn't exist
+            open(SERVER_LOG_PATH, 'a').close()
+            print(f"Created log file: {SERVER_LOG_PATH}")
+        except Exception as e:
+            print(f"Error creating log file: {e}")
+            return False
+    
+    # Check if the file is readable
+    if not os.access(SERVER_LOG_PATH, os.R_OK):
+        print(f"Warning: Log file {SERVER_LOG_PATH} is not readable.")
+        return False
+        
+    print(f"Log file {SERVER_LOG_PATH} is accessible.")
+    
+    # Check for server process
     try:
-        # Look for bedrock_server process
         output = subprocess.check_output(["pgrep", "-f", "bedrock_server"], universal_newlines=True)
         server_pid = output.strip()
         print(f"Found existing Minecraft server process: {server_pid}")
     except subprocess.CalledProcessError:
         print("No running Minecraft server found.")
     
-    # Create or truncate the log file
-    with open(SERVER_LOG_PATH, 'w') as f:
-        pass
-    
-    # Check if we can access the server's standard output via its parent process
-    if server_pid:
-        print("Setting up log redirection...")
-        try:
-            # This is a bit hacky but can work in some configurations
-            # Create a small script to redirect output
-            redirect_script = """#!/bin/bash
-tail -f /proc/$(pgrep -f bedrock_server)/fd/1 >> {log_file} &
-tail -f /proc/$(pgrep -f bedrock_server)/fd/2 >> {log_file} &
-""".format(log_file=SERVER_LOG_PATH)
-            
-            # Write and execute the script
-            with open("/tmp/redirect_minecraft.sh", "w") as f:
-                f.write(redirect_script)
-            
-            subprocess.call(["chmod", "+x", "/tmp/redirect_minecraft.sh"])
-            subprocess.Popen(["/tmp/redirect_minecraft.sh"], shell=True)
-            
-            print("Log redirection set up successfully.")
-        except Exception as e:
-            print(f"Failed to set up log redirection: {e}")
+    return True
 
 def monitor_server_log():
     """Monitor the log file for player connections."""
     print(f"Starting to monitor log file: {SERVER_LOG_PATH}")
     send_telegram_message("🎮 Minecraft server notification system is now active!")
     
-    # Create the log file if it doesn't exist
-    if not os.path.exists(SERVER_LOG_PATH):
-        open(SERVER_LOG_PATH, 'a').close()
-        print(f"Created log file: {SERVER_LOG_PATH}")
-    
     # Start from the end of the file
     file_size = os.path.getsize(SERVER_LOG_PATH)
+    print(f"Starting monitoring from position {file_size} in log file")
     
     # Precompile regular expressions for better performance
-    # Pattern for Bedrock server player connections and disconnections
-    player_join_pattern = re.compile(r"Player connected: (.*?)(?:,|$)")
-    player_leave_pattern = re.compile(r"Player disconnected: (.*?)(?:,|$)")
+    # These patterns match Bedrock server player connection events
+    player_join_patterns = [
+        re.compile(r"Player connected: (.*?)(?:,|$)"),           # Standard format
+        re.compile(r"Player (.*?) has connected"),                # Alternate format
+        re.compile(r"(.*?) joined the game"),                     # Java-like format
+        re.compile(r"(?:Player|Client) (.*?) connected"),         # Another variant
+        re.compile(r"\[INFO\].*? (.*?) joined the game")          # Log format with INFO prefix
+    ]
+    
+    player_leave_patterns = [
+        re.compile(r"Player disconnected: (.*?)(?:,|$)"),         # Standard format
+        re.compile(r"Player (.*?) has disconnected"),             # Alternate format
+        re.compile(r"(.*?) left the game"),                       # Java-like format
+        re.compile(r"(?:Player|Client) (.*?) disconnected"),      # Another variant
+        re.compile(r"\[INFO\].*? (.*?) left the game")            # Log format with INFO prefix
+    ]
     
     try:
         while True:
             # Check if file size has changed
-            current_size = os.path.getsize(SERVER_LOG_PATH)
-            
-            if current_size > file_size:
-                with open(SERVER_LOG_PATH, 'r') as f:
-                    # Move to the position we last read
-                    f.seek(file_size)
-                    
-                    # Read new content
-                    new_content = f.read()
-                    
-                    # Check for player connections
-                    for match in player_join_pattern.finditer(new_content):
-                        player_name = match.group(1)
-                        send_telegram_message(f"🎮 Player {player_name} has joined the Minecraft server!")
-                    
-                    # Check for player disconnections
-                    for match in player_leave_pattern.finditer(new_content):
-                        player_name = match.group(1)
-                        send_telegram_message(f"👋 Player {player_name} has left the Minecraft server")
-                
-                # Update the file position
-                file_size = current_size
-            
-            # Also check directly with server's process
             try:
-                # This directly checks server output
-                server_check = subprocess.run(
-                    ["grep", "-E", "Player (connected|disconnected)", "/proc/$(pgrep -f bedrock_server)/fd/1"],
-                    shell=True, capture_output=True, text=True
-                )
-                if server_check.stdout:
-                    for line in server_check.stdout.splitlines():
-                        # Processing direct server output
-                        join_match = player_join_pattern.search(line)
-                        if join_match:
-                            player_name = join_match.group(1)
-                            send_telegram_message(f"🎮 Player {player_name} has joined the Minecraft server!")
+                current_size = os.path.getsize(SERVER_LOG_PATH)
+                
+                if current_size > file_size:
+                    print(f"Log file changed: {file_size} -> {current_size} bytes")
+                    with open(SERVER_LOG_PATH, 'r', errors='replace') as f:
+                        # Move to the position we last read
+                        f.seek(file_size)
+                        
+                        # Read new content
+                        new_content = f.read()
+                        
+                        # Debug - print what we're reading
+                        if new_content.strip():
+                            print(f"New log content: {new_content.strip()}")
+                        
+                        # Process each line separately
+                        for line in new_content.splitlines():
+                            # Check for player connections with all patterns
+                            for pattern in player_join_patterns:
+                                match = pattern.search(line)
+                                if match:
+                                    player_name = match.group(1)
+                                    print(f"Detected player join: {player_name}")
+                                    send_telegram_message(f"🎮 Player {player_name} has joined the Minecraft server!")
+                                    break
                             
-                        leave_match = player_leave_pattern.search(line)
-                        if leave_match:
-                            player_name = leave_match.group(1)
-                            send_telegram_message(f"👋 Player {player_name} has left the Minecraft server")
+                            # Check for player disconnections with all patterns
+                            for pattern in player_leave_patterns:
+                                match = pattern.search(line)
+                                if match:
+                                    player_name = match.group(1)
+                                    print(f"Detected player leave: {player_name}")
+                                    send_telegram_message(f"👋 Player {player_name} has left the Minecraft server")
+                                    break
+                    
+                    # Update the file position
+                    file_size = current_size
+            
             except Exception as e:
-                # Ignore errors in direct server output check
-                pass
+                print(f"Error reading log file: {e}")
+                # If the file becomes inaccessible, wait and retry
+                time.sleep(5)
+                continue
             
             # Wait before checking again
             time.sleep(POLL_INTERVAL)
@@ -164,11 +164,13 @@ def main():
     print("Minecraft Bedrock Server Telegram Notifier")
     print("------------------------------------------")
     
-    # Try to set up log redirection
-    setup_log_redirection()
-    
-    # Begin monitoring
-    monitor_server_log()
+    # Check log file accessibility
+    if check_log_file():
+        # Begin monitoring
+        monitor_server_log()
+    else:
+        print("ERROR: Cannot access log file. Notification system cannot start.")
+        send_telegram_message("⚠️ Minecraft notification system failed to start: Cannot access log file.")
 
 if __name__ == "__main__":
     # Register signal handlers
