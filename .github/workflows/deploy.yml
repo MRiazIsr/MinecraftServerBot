@@ -21,4 +21,6 @@ jobs:
       
       - name: Deploy to server with Telegram secrets
         run: |
-          ssh ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} "export TELEGRAM_BOT_TOKEN='${{ secrets.TELEGRAM_BOT_TOKEN }}' && export TELEGRAM_CHAT_ID='${{ secrets.TELEGRAM_CHAT_ID }}' && cd ~/minecraft-bedrock && bash -s" < .github/scripts/deploy.sh
+          ssh ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} "export TELEGRAM_BOT_TOKEN='${{ secrets.TELEGRAM_BOT_TOKEN }}' && export TELEGRAM_CHAT_ID='${{ secrets.TELEGRAM_CHAT_ID }}' && cd ~/minecraft-scripts && git pull && bash update-server.sh"
+
+
