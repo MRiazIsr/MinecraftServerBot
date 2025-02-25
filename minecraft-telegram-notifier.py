@@ -10,7 +10,7 @@ from datetime import datetime
 # Configuration - Read from environment variables
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
-SERVER_LOG_PATH = "/home/ubuntu/minecraft-bedrock/log.txt"  # This is the actual log file found on your server
+SERVER_LOG_PATH = "/home/ubuntu/minecraft-bedrock/logs.txt"  # This is the actual log file found on your server
 POLL_INTERVAL = 1  # seconds between checks
 
 # Check if Telegram configuration is available
