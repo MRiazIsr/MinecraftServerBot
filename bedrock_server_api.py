@@ -1,317 +1,589 @@
 #!/usr/bin/env python3
 import os
-import time
-import re
-import requests
 import subprocess
-import signal
-from datetime import datetime
-import json
+import re
+import time
 import socket
 import threading
-import sys
+import json
+import logging
+from datetime import datetime
+from pathlib import Path
 
-# Add error handling for import
-try:
-    from bedrock_server_api import BedrockServerAPI
-    print("Successfully imported BedrockServerAPI")
-except ImportError as e:
-    print(f"ERROR: Failed to import BedrockServerAPI: {e}")
-    print("Current directory:", os.getcwd())
-    print("Files in directory:", os.listdir('.'))
-    sys.exit(1)
+# Set up logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler("minecraft_bot.log")
+    ]
+)
 
-# Configuration - Read from environment variables
-TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
-SERVER_LOG_PATH = os.path.join(os.getcwd(), "logs.txt")  # Use current directory
-SERVER_PATH = os.getcwd()  # Use current directory
-SERVER_IP = os.environ.get("SERVER_IP", "127.0.0.1")  # Your server's public IP
-SERVER_PORT = int(os.environ.get("SERVER_PORT", "19132"))  # Default Bedrock port
+logger = logging.getLogger("BedrockServerAPI")
 
-print(f"Configuration loaded:")
-print(f"- Server path: {SERVER_PATH}")
-print(f"- Log path: {SERVER_LOG_PATH}")
-print(f"- Server IP: {SERVER_IP}")
-print(f"- Server port: {SERVER_PORT}")
-print(f"- Telegram bot configured: {bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID)}")
-
-# Check if Telegram configuration is available
-if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-    print("Warning: Telegram credentials not found in environment variables.")
-    print("Notifications will be disabled.")
-    NOTIFICATIONS_ENABLED = False
-else:
-    NOTIFICATIONS_ENABLED = True
-
-# Initialize the server API
-try:
-    server_api = BedrockServerAPI(
-        server_path=SERVER_PATH,
-        log_path=SERVER_LOG_PATH,
-        server_port=SERVER_PORT
-    )
-    print("Server API initialized successfully")
-except Exception as e:
-    print(f"ERROR: Failed to initialize server API: {e}")
-    sys.exit(1)
-
-def send_telegram_message(message, chat_id=None):
-    """Send message to Telegram chat using environment variables."""
-    if not NOTIFICATIONS_ENABLED and not chat_id:
-        print(f"Message not sent (notifications disabled): {message}")
-        return
+class BedrockServerAPI:
+    """A class to interact with a Minecraft Bedrock server running on the same machine."""
     
-    # If no specific chat_id is provided, use the default one
-    if not chat_id:
-        chat_id = TELEGRAM_CHAT_ID
+    def __init__(self, server_path="/home/ubuntu/minecraft-bedrock", 
+                 log_path="/home/ubuntu/minecraft-bedrock/logs.txt",
+                 server_port=19132):
+        """Initialize the API.
         
-    api_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    data = {
-        "chat_id": chat_id,
-        "text": message,
-        "parse_mode": "HTML"
-    }
-    
-    try:
-        response = requests.post(api_url, data=data)
-        if response.status_code != 200:
-            print(f"Failed to send Telegram message: {response.text}")
-        else:
-            print(f"Notification sent to {chat_id}: {message}")
-    except Exception as e:
-        print(f"Error sending Telegram message: {e}")
-
-def handle_telegram_commands(update):
-    """Handle incoming Telegram commands."""
-    try:
-        # Extract message content and chat ID
-        message = update.get("message", {})
-        text = message.get("text", "")
-        chat_id = message.get("chat", {}).get("id")
+        Args:
+            server_path: Path to the Bedrock server directory
+            log_path: Path to the server log file
+            server_port: The port the server is running on
+        """
+        self.server_path = server_path
+        self.log_path = log_path
+        self.server_port = server_port
+        self.server_process = None
+        self.input_pipe = None
+        self.event_callbacks = {
+            'player_join': [],
+            'player_leave': [],
+            'chat_message': [],
+            'server_start': [],
+            'server_stop': []
+        }
         
-        if not text or not chat_id:
-            return
+        # Make paths absolute
+        self.server_path = os.path.abspath(self.server_path)
+        self.log_path = os.path.abspath(self.log_path)
         
-        # Log all received commands
-        print(f"Received command from chat {chat_id}: {text}")
+        logger.info(f"Initialized API with server path: {self.server_path}")
+        logger.info(f"Log path: {self.log_path}")
         
-        # Handle /info command
-        if text.startswith("/info"):
-            # Check server status
-            server_status = "Online ✅" if server_api.is_server_running() else "Offline ❌"
-            
-            # Get player information
-            player_list = server_api.get_online_players()
-            player_count = len(player_list)
-            
-            # Create response message
-            response = f"<b>Server Status:</b> {server_status}\n"
-            response += f"<b>Server IP:</b> <code>{SERVER_IP}:{SERVER_PORT}</code>\n"
-            
-            if server_status == "Online ✅":
-                response += f"<b>Players Online:</b> {player_count}\n"
-                if player_count > 0:
-                    response += "\n<b>Players:</b>\n"
-                    for player in player_list:
-                        response += f"• {player}\n"
-            
-            # Send the response
-            send_telegram_message(response, chat_id)
-            print(f"Responded to /info command from chat {chat_id}")
-        
-        # Handle /help command
-        elif text.startswith("/help"):
-            help_text = """
-<b>Available Commands:</b>
-• /info - Show server status, IP, and online players
-• /help - Show this help message
-• /start - Start the Minecraft server
-• /stop - Stop the Minecraft server
-• /cmd <command> - Run a Minecraft server command
-• /restart - Restart the notification bot
-• /debug - Show debug information
-"""
-            send_telegram_message(help_text, chat_id)
-            print(f"Responded to /help command from chat {chat_id}")
-            
-        # Handle /start command
-        elif text.startswith("/start"):
-            if server_api.is_server_running():
-                send_telegram_message("⚠️ Minecraft server is already running", chat_id)
-            else:
-                send_telegram_message("🔄 Starting Minecraft server...", chat_id)
-                success = server_api.start_server()
-                if success:
-                    send_telegram_message("✅ Minecraft server started successfully", chat_id)
-                else:
-                    send_telegram_message("❌ Failed to start Minecraft server", chat_id)
-        
-        # Handle /stop command
-        elif text.startswith("/stop"):
-            if not server_api.is_server_running():
-                send_telegram_message("⚠️ Minecraft server is not running", chat_id)
-            else:
-                send_telegram_message("🔄 Stopping Minecraft server...", chat_id)
-                success = server_api.stop_server()
-                if success:
-                    send_telegram_message("✅ Minecraft server stopped successfully", chat_id)
-                else:
-                    send_telegram_message("❌ Failed to stop Minecraft server", chat_id)
-                    
-        # Handle /cmd command
-        elif text.startswith("/cmd "):
-            if not server_api.is_server_running():
-                send_telegram_message("⚠️ Cannot run command: Minecraft server is not running", chat_id)
-            else:
-                command = text[5:].strip()  # Remove "/cmd " prefix
-                if not command:
-                    send_telegram_message("⚠️ Please specify a command to run", chat_id)
-                else:
-                    send_telegram_message(f"🔄 Running command: <code>{command}</code>", chat_id)
-                    success = server_api.run_command(command)
-                    if success:
-                        send_telegram_message("✅ Command sent successfully", chat_id)
-                    else:
-                        send_telegram_message("❌ Failed to send command", chat_id)
-                        
-        # Handle /restart command (restart the bot)
-        elif text.startswith("/restart"):
-            send_telegram_message("🔄 Restarting the notification bot...", chat_id)
-            print("Restart command received, exiting process...")
-            # The systemd service will restart the bot
-            os._exit(0)
-            
-        # Handle /debug command
-        elif text.startswith("/debug"):
-            debug_info = f"""
-<b>Debug Information:</b>
-• <b>Bot Version:</b> 1.0
-• <b>Server Path:</b> <code>{SERVER_PATH}</code>
-• <b>Log Path:</b> <code>{SERVER_LOG_PATH}</code>
-• <b>Server IP:</b> <code>{SERVER_IP}</code>
-• <b>Server Port:</b> <code>{SERVER_PORT}</code>
-• <b>Server Running:</b> {server_api.is_server_running()}
-• <b>Log File Exists:</b> {os.path.exists(SERVER_LOG_PATH)}
-• <b>Log File Size:</b> {os.path.getsize(SERVER_LOG_PATH) if os.path.exists(SERVER_LOG_PATH) else 0} bytes
-• <b>Current Directory:</b> <code>{os.getcwd()}</code>
-• <b>Python Version:</b> <code>{sys.version}</code>
-"""
-            send_telegram_message(debug_info, chat_id)
-            print(f"Responded to /debug command from chat {chat_id}")
-    
-    except Exception as e:
-        error_message = f"⚠️ Error processing command: {str(e)}"
-        print(f"Error handling command: {e}")
+        # Create the log file directory if it doesn't exist
+        log_dir = os.path.dirname(self.log_path)
         try:
-            send_telegram_message(error_message, chat_id)
-        except:
-            pass
-
-def start_command_listener():
-    """Start a background thread to listen for Telegram commands."""
-    # Using long polling to listen for updates
-    last_update_id = 0
-    
-    print("Starting Telegram command listener...")
-    
-    while True:
-        try:
-            # Get updates from Telegram
-            api_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
-            params = {
-                "offset": last_update_id + 1,
-                "timeout": 30
-            }
-            
-            response = requests.get(api_url, params=params)
-            if response.status_code == 200:
-                updates = response.json().get("result", [])
-                
-                for update in updates:
-                    # Process the update
-                    update_id = update.get("update_id")
-                    last_update_id = max(last_update_id, update_id)
-                    
-                    # Handle commands
-                    handle_telegram_commands(update)
-            
-            time.sleep(1)  # Small delay to avoid hammering the API
-        
+            os.makedirs(log_dir, exist_ok=True)
         except Exception as e:
-            print(f"Error in command listener: {e}")
-            time.sleep(5)  # Wait a bit longer on error
-
-def setup_server_event_handlers():
-    """Set up handlers for server events."""
-    try:
-        # Player join event
-        server_api.on('player_join', lambda data: 
-            send_telegram_message(f"🎮 Player {data['player']} has joined the Minecraft server!")
-        )
+            logger.error(f"Failed to create log directory: {e}")
         
-        # Player leave event
-        server_api.on('player_leave', lambda data: 
-            send_telegram_message(f"👋 Player {data['player']} has left the Minecraft server")
-        )
+        # Create the log file if it doesn't exist
+        self._ensure_log_file_exists()
         
-        # Chat message event
-        server_api.on('chat_message', lambda data: 
-            send_telegram_message(f"💬 <b>{data['player']}</b>: {data['message']}")
-        )
+    def _ensure_log_file_exists(self):
+        """Create the log file if it doesn't exist, with robust error handling."""
+        try:
+            if not os.path.exists(self.log_path):
+                logger.info(f"Log file doesn't exist, creating: {self.log_path}")
+                # Create an empty file
+                with open(self.log_path, 'w') as f:
+                    pass
+                
+                # Set appropriate permissions
+                try:
+                    os.chmod(self.log_path, 0o644)  # Owner read/write, group/others read
+                except Exception as perm_error:
+                    logger.warning(f"Could not set permissions on log file: {perm_error}")
+                
+                return True
+        except Exception as e:
+            logger.error(f"Error creating log file: {e}")
+            return False
         
-        # Server start event
-        server_api.on('server_start', lambda data: 
-            send_telegram_message("🟢 Minecraft server has started")
-        )
+        return True
         
-        # Server stop event
-        server_api.on('server_stop', lambda data: 
-            send_telegram_message("🔴 Minecraft server has stopped")
-        )
+    def is_server_running(self):
+        """Check if the Bedrock server process is running with multiple fallback methods."""
+        try:
+            # Method 1: Check using pgrep
+            try:
+                subprocess.check_output(["pgrep", "-f", "bedrock_server"], universal_newlines=True)
+                logger.debug("Server detected as running via pgrep")
+                return True
+            except subprocess.CalledProcessError:
+                # pgrep didn't find the process, but let's try other methods
+                pass
+            
+            # Method 2: Check for running screens with the minecraft server
+            try:
+                screen_output = subprocess.check_output(["screen", "-ls"], universal_newlines=True)
+                if "minecraft" in screen_output:
+                    logger.debug("Server detected as running via screen session")
+                    return True
+            except (subprocess.CalledProcessError, FileNotFoundError):
+                # screen command failed or isn't installed
+                pass
+            
+            # Method 3: Check if port is in use
+            try:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                sock.bind(('0.0.0.0', self.server_port))
+                sock.close()
+                # If we can bind to the port, the server is not running
+                return False
+            except socket.error:
+                # Port is in use, likely by the server
+                logger.debug("Server detected as running via port check")
+                return True
+            
+            # If all methods fail, assume server is not running
+            return False
+            
+        except Exception as e:
+            logger.error(f"Error checking server status: {e}")
+            # Default to assuming the server is running to prevent accidental restarts
+            return True
         
-        print("Server event handlers set up successfully")
-    except Exception as e:
-        print(f"Error setting up event handlers: {e}")
-
-def main():
-    print("Minecraft Bedrock Server Telegram Notifier v1.0")
-    print("----------------------------------------------")
+    def start_server(self):
+        """Start the Bedrock server if it's not already running with multiple methods."""
+        if self.is_server_running():
+            logger.info("Server is already running")
+            return True
+            
+        logger.info("Attempting to start server...")
+        
+        # Track if any method succeeded
+        success = False
+        
+        try:
+            # Change to server directory
+            original_dir = os.getcwd()
+            os.chdir(self.server_path)
+            
+            # Try multiple methods to start the server
+            
+            # Method 1: Using screen
+            try:
+                logger.info("Attempting to start server with screen...")
+                screen_cmd = ["screen", "-dmS", "minecraft", "./bedrock_server"]
+                subprocess.run(screen_cmd, check=True)
+                success = True
+                logger.info("Server started with screen")
+            except Exception as e:
+                logger.warning(f"Failed to start server with screen: {e}")
+            
+            # Method 2: Using tmux if screen failed
+            if not success:
+                try:
+                    logger.info("Attempting to start server with tmux...")
+                    tmux_cmd = ["tmux", "new-session", "-d", "-s", "minecraft", "./bedrock_server"]
+                    subprocess.run(tmux_cmd, check=True)
+                    success = True
+                    logger.info("Server started with tmux")
+                except Exception as e:
+                    logger.warning(f"Failed to start server with tmux: {e}")
+            
+            # Method 3: Direct process (last resort, may not be ideal for production)
+            if not success:
+                try:
+                    logger.info("Attempting to start server directly...")
+                    # Start as background process
+                    subprocess.Popen(
+                        ["./bedrock_server"], 
+                        stdout=open("server_output.log", "a"),
+                        stderr=subprocess.STDOUT,
+                        start_new_session=True
+                    )
+                    success = True
+                    logger.info("Server started directly")
+                except Exception as e:
+                    logger.error(f"Failed to start server directly: {e}")
+            
+            # Change back to original directory
+            os.chdir(original_dir)
+            
+            # Wait for the server to finish starting
+            if success:
+                time.sleep(5)  # Give the server a moment to initialize
+                
+                # Verify server is actually running
+                if not self.is_server_running():
+                    logger.error("Server failed to start despite successful command execution")
+                    success = False
+                else:
+                    # Trigger server start event
+                    self._trigger_event('server_start', {})
+            
+            return success
+        except Exception as e:
+            logger.error(f"Error starting server: {e}")
+            return False
+            
+    def stop_server(self):
+        """Stop the Bedrock server gracefully with multiple methods."""
+        if not self.is_server_running():
+            logger.info("Server is not running")
+            return True
+            
+        try:
+            # Method 1: Try running the stop command
+            logger.info("Attempting to stop server gracefully...")
+            self.run_command("stop")
+            
+            # Give the server a moment to shut down
+            for i in range(10):  # Wait up to 10 seconds
+                time.sleep(1)
+                if not self.is_server_running():
+                    logger.info("Server stopped gracefully")
+                    self._trigger_event('server_stop', {})
+                    return True
+            
+            logger.warning("Server didn't stop with command after 10 seconds")
+            
+            # Method 2: Try killing the process with SIGTERM
+            logger.info("Attempting to stop server with SIGTERM...")
+            try:
+                subprocess.run(["pkill", "-TERM", "-f", "bedrock_server"], check=True)
+                time.sleep(3)
+                if not self.is_server_running():
+                    logger.info("Server stopped with SIGTERM")
+                    self._trigger_event('server_stop', {})
+                    return True
+            except Exception as e:
+                logger.warning(f"Error stopping server with SIGTERM: {e}")
+            
+            # Method 3: Force kill as last resort
+            logger.warning("Server didn't stop gracefully, forcing stop...")
+            try:
+                subprocess.run(["pkill", "-KILL", "-f", "bedrock_server"], check=True)
+                time.sleep(1)
+                if not self.is_server_running():
+                    logger.info("Server stopped forcefully")
+                    self._trigger_event('server_stop', {})
+                    return True
+                else:
+                    logger.error("Failed to stop server even with SIGKILL")
+                    return False
+            except Exception as e:
+                logger.error(f"Error force stopping server: {e}")
+                return False
+                
+        except Exception as e:
+            logger.error(f"Error stopping server: {e}")
+            return False
     
-    # Set up server event handlers
-    setup_server_event_handlers()
+    def run_command(self, command):
+        """Run a command on the Bedrock server with multiple methods.
+        
+        Args:
+            command: The command to run (without leading slash)
+        
+        Returns:
+            bool: Whether the command was sent successfully
+        """
+        if not self.is_server_running():
+            logger.warning("Cannot run command: Server is not running")
+            return False
+            
+        logger.info(f"Running command: {command}")
+        
+        try:
+            # Try multiple methods to send the command
+            
+            # Method 1: Using screen
+            try:
+                screen_cmd = f"screen -S minecraft -X stuff '{command}\n'"
+                subprocess.run(screen_cmd, shell=True, check=True)
+                logger.info(f"Command sent via screen: {command}")
+                return True
+            except subprocess.CalledProcessError:
+                logger.debug("Failed to send command via screen")
+            
+            # Method 2: Using tmux
+            try:
+                tmux_cmd = f"tmux send-keys -t minecraft '{command}' Enter"
+                subprocess.run(tmux_cmd, shell=True, check=True)
+                logger.info(f"Command sent via tmux: {command}")
+                return True
+            except subprocess.CalledProcessError:
+                logger.debug("Failed to send command via tmux")
+            
+            # Method 3: Find and attach to the process's stdin (advanced)
+            try:
+                # This approach is more complex and would require additional logic
+                # to find and connect to the server process's stdin
+                logger.debug("Direct stdin connection not implemented")
+            except Exception:
+                pass
+            
+            logger.warning(f"Could not find a method to send command: {command}")
+            return False
+        except Exception as e:
+            logger.error(f"Error running command: {e}")
+            return False
     
-    # Start the log monitor
-    try:
-        server_api.start_log_monitor()
-        print("Log monitor started successfully")
-    except Exception as e:
-        print(f"Error starting log monitor: {e}")
-        send_telegram_message(f"⚠️ Error starting log monitor: {str(e)}")
-        # Continue anyway - we might still be able to send commands
+    def get_online_players(self):
+        """Get a list of online players using multiple methods."""
+        online_players = []
+        
+        try:
+            # Method 1: Parse the log file (from your existing code)
+            log_players = self._get_players_from_log()
+            if log_players:
+                online_players.extend(log_players)
+                logger.debug(f"Found {len(log_players)} players from log file")
+            
+            # Method 2: Try running the 'list' command and capturing output
+            # This would require more advanced handling to capture command output
+            
+            # Deduplicate the list
+            online_players = list(set(online_players))
+            
+            return online_players
+        except Exception as e:
+            logger.error(f"Error getting player list: {e}")
+            return []
     
-    # Send startup notification
-    send_telegram_message("🎮 Minecraft server notification system is now active!")
+    def _get_players_from_log(self):
+        """Get player list by parsing the log file with robust error handling."""
+        try:
+            # Make sure log file exists
+            if not os.path.exists(self.log_path):
+                logger.warning(f"Log file doesn't exist: {self.log_path}")
+                self._ensure_log_file_exists()
+                return []
+                
+            # Check if log file is readable
+            if not os.access(self.log_path, os.R_OK):
+                logger.warning(f"Log file is not readable: {self.log_path}")
+                return []
+                
+            # Check if log file is empty
+            if os.path.getsize(self.log_path) == 0:
+                logger.debug("Log file is empty")
+                return []
+            
+            # This uses a simple approach by checking recent log entries
+            # Read the last 1000 lines of the log file
+            try:
+                output = subprocess.check_output(["tail", "-n", "1000", self.log_path], universal_newlines=True)
+            except subprocess.CalledProcessError:
+                logger.warning("Failed to read log file with tail command")
+                # Fallback: read directly
+                try:
+                    with open(self.log_path, 'r', errors='replace') as f:
+                        lines = f.readlines()
+                        output = ''.join(lines[-1000:] if len(lines) > 1000 else lines)
+                except Exception as read_error:
+                    logger.error(f"Failed to read log file directly: {read_error}")
+                    return []
+            
+            # Find all player connections and disconnections
+            connected_players = []
+            disconnected_players = []
+            
+            # These patterns match Bedrock server player connection events
+            player_join_patterns = [
+                re.compile(r"Player connected: (.*?)(?:,|$)"),
+                re.compile(r"Player (.*?) has connected"),
+                re.compile(r"(.*?) joined the game"),
+                re.compile(r"(?:Player|Client) (.*?) connected"),
+                re.compile(r"\[INFO\].*? (.*?) joined the game")
+            ]
+            
+            player_leave_patterns = [
+                re.compile(r"Player disconnected: (.*?)(?:,|$)"),
+                re.compile(r"Player (.*?) has disconnected"),
+                re.compile(r"(.*?) left the game"),
+                re.compile(r"(?:Player|Client) (.*?) disconnected"),
+                re.compile(r"\[INFO\].*? (.*?) left the game")
+            ]
+            
+            # Process each line
+            for line in output.splitlines():
+                # Check for player connections
+                for pattern in player_join_patterns:
+                    match = pattern.search(line)
+                    if match:
+                        player_name = match.group(1).strip()
+                        if player_name and player_name not in connected_players:
+                            connected_players.append(player_name)
+                
+                # Check for player disconnections
+                for pattern in player_leave_patterns:
+                    match = pattern.search(line)
+                    if match:
+                        player_name = match.group(1).strip()
+                        if player_name:
+                            disconnected_players.append(player_name)
+            
+            # Filter out disconnected players
+            current_players = [p for p in connected_players if p not in disconnected_players]
+            
+            return current_players
+            
+        except Exception as e:
+            logger.error(f"Error parsing log file for players: {e}")
+            return []
     
-    # Start the command listener
-    start_command_listener()
-
-if __name__ == "__main__":
-    # Register signal handlers
-    def handle_exit(signum, frame):
-        print(f"Received signal {signum}, shutting down...")
-        send_telegram_message("🛑 Minecraft server notification system has been stopped.")
-        exit(0)
+    def on(self, event_type, callback):
+        """Register a callback for a specific event.
+        
+        Args:
+            event_type: The type of event ('player_join', 'player_leave', etc.)
+            callback: The function to call when the event occurs
+        """
+        if event_type in self.event_callbacks:
+            self.event_callbacks[event_type].append(callback)
+            logger.debug(f"Registered callback for event: {event_type}")
+            return True
+        logger.warning(f"Attempted to register callback for unknown event: {event_type}")
+        return False
     
-    signal.signal(signal.SIGTERM, handle_exit)
-    signal.signal(signal.SIGINT, handle_exit)
+    def _trigger_event(self, event_type, data):
+        """Trigger callbacks for an event.
+        
+        Args:
+            event_type: The type of event
+            data: Data to pass to the callbacks
+        """
+        if event_type in self.event_callbacks:
+            for callback in self.event_callbacks[event_type]:
+                try:
+                    callback(data)
+                except Exception as e:
+                    logger.error(f"Error in {event_type} callback: {e}")
     
-    try:
-        main()
-    except Exception as e:
-        error_message = f"CRITICAL ERROR: {str(e)}"
-        print(error_message)
-        send_telegram_message(f"⚠️ {error_message}")
-        # Wait a moment to ensure message is sent
-        time.sleep(2)
-        sys.exit(1)
+    def start_log_monitor(self):
+        """Start monitoring the log file for events."""
+        # Create a dedicated thread for log monitoring
+        self.log_monitor_thread = threading.Thread(
+            target=self._monitor_log_file,
+            daemon=True,
+            name="LogMonitorThread"
+        )
+        self.log_monitor_thread.start()
+        logger.info("Log monitor thread started")
+            
+    def _monitor_log_file(self):
+        """Monitor the log file for events with robust error handling."""
+        logger.info(f"Starting to monitor log file: {self.log_path}")
+        
+        # Create the log file if it doesn't exist
+        if not self._ensure_log_file_exists():
+            logger.error("Failed to create or access log file, monitoring may not work")
+        
+        # Get current file size or create file if it doesn't exist
+        try:
+            file_size = os.path.getsize(self.log_path)
+        except Exception as e:
+            logger.error(f"Error getting initial file size: {e}")
+            file_size = 0
+        
+        # Precompile regular expressions for better performance
+        player_join_patterns = [
+            re.compile(r"Player connected: (.*?)(?:,|$)"),
+            re.compile(r"Player (.*?) has connected"),
+            re.compile(r"(.*?) joined the game"),
+            re.compile(r"(?:Player|Client) (.*?) connected"),
+            re.compile(r"\[INFO\].*? (.*?) joined the game")
+        ]
+        
+        player_leave_patterns = [
+            re.compile(r"Player disconnected: (.*?)(?:,|$)"),
+            re.compile(r"Player (.*?) has disconnected"),
+            re.compile(r"(.*?) left the game"),
+            re.compile(r"(?:Player|Client) (.*?) disconnected"),
+            re.compile(r"\[INFO\].*? (.*?) left the game")
+        ]
+        
+        chat_patterns = [
+            re.compile(r"\[CHAT\] (.*?): (.*)"),
+            re.compile(r"\[INFO\] (.*?) says: (.*)"),
+            re.compile(r"<(.*?)> (.*)")
+        ]
+        
+        logger.info(f"Starting monitoring from position {file_size} in log file")
+        
+        consecutive_errors = 0
+        max_consecutive_errors = 5
+        
+        while True:
+            try:
+                # Check if log file exists
+                if not os.path.exists(self.log_path):
+                    logger.warning("Log file disappeared, attempting to recreate")
+                    self._ensure_log_file_exists()
+                    file_size = 0
+                    time.sleep(5)
+                    continue
+                
+                # Check if file size has changed
+                try:
+                    current_size = os.path.getsize(self.log_path)
+                except Exception as e:
+                    logger.error(f"Error getting current file size: {e}")
+                    time.sleep(5)
+                    continue
+                
+                # Check if file was truncated (e.g., log rotation)
+                if current_size < file_size:
+                    logger.info("Log file was truncated, resetting position")
+                    file_size = 0
+                
+                if current_size > file_size:
+                    try:
+                        with open(self.log_path, 'r', errors='replace') as f:
+                            # Move to the position we last read
+                            f.seek(file_size)
+                            
+                            # Read new content
+                            new_content = f.read()
+                            
+                            # Process each line separately
+                            for line in new_content.splitlines():
+                                line = line.strip()
+                                if not line:
+                                    continue
+                                    
+                                # Check for player joins
+                                for pattern in player_join_patterns:
+                                    match = pattern.search(line)
+                                    if match:
+                                        player_name = match.group(1).strip()
+                                        if player_name:
+                                            logger.info(f"Detected player join: {player_name}")
+                                            self._trigger_event('player_join', {'player': player_name})
+                                            break
+                                
+                                # Check for player leaves
+                                for pattern in player_leave_patterns:
+                                    match = pattern.search(line)
+                                    if match:
+                                        player_name = match.group(1).strip()
+                                        if player_name:
+                                            logger.info(f"Detected player leave: {player_name}")
+                                            self._trigger_event('player_leave', {'player': player_name})
+                                            break
+                                        
+                                # Check for chat messages
+                                for pattern in chat_patterns:
+                                    match = pattern.search(line)
+                                    if match:
+                                        player_name = match.group(1).strip()
+                                        message = match.group(2).strip()
+                                        if player_name and message:
+                                            logger.info(f"Detected chat message: {player_name}: {message}")
+                                            self._trigger_event('chat_message', {
+                                                'player': player_name,
+                                                'message': message
+                                            })
+                                            break
+                                            
+                        # Reset consecutive errors counter
+                        consecutive_errors = 0
+                    except Exception as e:
+                        logger.error(f"Error reading log file content: {e}")
+                        consecutive_errors += 1
+                        if consecutive_errors >= max_consecutive_errors:
+                            logger.critical(f"Too many consecutive errors ({consecutive_errors}), resetting file position")
+                            file_size = 0
+                            consecutive_errors = 0
+                        time.sleep(5)
+                        continue
+                    
+                    # Update the file position
+                    file_size = current_size
+            
+            except Exception as e:
+                logger.error(f"Unexpected error in log monitor: {e}")
+                time.sleep(5)
+                continue
+            
+            # Wait before checking again
+            time.sleep(1)
