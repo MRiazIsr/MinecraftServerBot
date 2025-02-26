@@ -299,4 +299,19 @@ def main():
 if __name__ == "__main__":
     # Register signal handlers
     def handle_exit(signum, frame):
-        print(f"
+        print(f"Received signal {signum}, shutting down...")
+        send_telegram_message("🛑 Minecraft server notification system has been stopped.")
+        exit(0)
+    
+    signal.signal(signal.SIGTERM, handle_exit)
+    signal.signal(signal.SIGINT, handle_exit)
+    
+    try:
+        main()
+    except Exception as e:
+        error_message = f"CRITICAL ERROR: {str(e)}"
+        print(error_message)
+        send_telegram_message(f"⚠️ {error_message}")
+        # Wait a moment to ensure message is sent
+        time.sleep(2)
+        sys.exit(1)
