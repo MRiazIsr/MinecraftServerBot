@@ -8,21 +8,9 @@ echo "Starting Minecraft server update..."
 
 # Add this near the beginning of your update-server.sh script
 echo "Installing Minecraft server logger..."
-cat > ${MINECRAFT_SERVER_DIR}/minecraft-logger.sh << 'EOF'
-#!/bin/bash
-# This script captures Minecraft Bedrock server output to logs.txt
-
-# Path configuration
-SERVER_DIR="/home/ubuntu/minecraft-bedrock"
-SERVER_EXECUTABLE="./bedrock_server"
-LOG_FILE="$SERVER_DIR/logs.txt"
-
-# Make sure we're in the server directory
-cd "$SERVER_DIR"
-
-# Start the server and pipe its output to both the console and the log file
-"$SERVER_EXECUTABLE" 2>&1 | tee -a "$LOG_FILE"
-EOF
+# Copy the logger script
+cp minecraft-logger.sh $MINECRAFT_SERVER_DIR/
+chmod +x $MINECRAFT_SERVER_DIR/minecraft-logger.sh
 
 chmod +x ${MINECRAFT_SERVER_DIR}/minecraft-logger.sh
 
