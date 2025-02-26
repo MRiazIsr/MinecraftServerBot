@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
+
 import os
 import time
+import datetime
 import requests
 import subprocess
 import signal
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta
 import json
 import threading
 
@@ -16,6 +18,10 @@ time.sleep(10)
 # Create a marker file to track restarts
 restart_marker_file = "/tmp/minecraft_bot_restart_count"
 MAX_RESTARTS_PER_HOUR = 5
+
+# Store the bot start time to ignore old messages
+BOT_START_TIME = int(time.time())
+print(f"Bot start timestamp: {BOT_START_TIME}")
 
 def check_restart_limit():
     """Check if we've restarted too many times recently"""
@@ -285,9 +291,18 @@ def handle_telegram_commands(update):
         text = message.get("text", "")
         chat_id = message.get("chat", {}).get("id")
         
+        # Get message date (Unix timestamp)
+        message_date = message.get("date", 0)
+        
         if not text or not chat_id:
             return
         
+        # CRITICAL FIX: Ignore messages that were sent before the bot started
+        # This prevents processing old messages that might trigger immediate restarts
+        if message_date < BOT_START_TIME:
+            print(f"Ignoring old message from {chat_id}: {text} (timestamp: {message_date}, bot start: {BOT_START_TIME})")
+            return
+            
         # Log all received commands
         print(f"Received command from chat {chat_id}: {text}")
         
@@ -407,9 +422,13 @@ def handle_telegram_commands(update):
                 except Exception:
                     pass
             
+            current_time = int(time.time())
             debug_info = f"""
 <b>Debug Information:</b>
-• <b>Bot Version:</b> 1.2
+• <b>Bot Version:</b> 1.3
+• <b>Bot Start Time:</b> {datetime.fromtimestamp(BOT_START_TIME).strftime('%Y-%m-%d %H:%M:%S')}
+• <b>Current Time:</b> {datetime.fromtimestamp(current_time).strftime('%Y-%m-%d %H:%M:%S')}
+• <b>Message Time:</b> {datetime.fromtimestamp(message_date).strftime('%Y-%m-%d %H:%M:%S')}
 • <b>Server Path:</b> <code>{SERVER_PATH}</code>
 • <b>Log Path:</b> <code>{SERVER_LOG_PATH}</code>
 • <b>Server IP:</b> <code>{SERVER_IP}</code>
@@ -446,6 +465,35 @@ def start_command_listener():
     max_retry_delay = 300  # Maximum retry delay in seconds (5 minutes)
     retry_delay = 1  # Start with 1 second delay
     
+    # First, clear any pending updates to avoid processing old commands
+    try:
+        print("Clearing pending updates...")
+        api_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
+        params = {
+            "offset": -1,  # Special value to get latest update
+            "timeout": 1
+        }
+        
+        response = requests.get(api_url, params=params, timeout=5)
+        if response.status_code == 200:
+            updates = response.json().get("result", [])
+            if updates:
+                # If we have any updates, get the highest update_id and mark everything up to that as read
+                last_update_id = updates[-1].get("update_id", 0)
+                
+                # Now mark everything as read by setting offset to last_update_id + 1
+                params = {
+                    "offset": last_update_id + 1,
+                    "timeout": 1
+                }
+                requests.get(api_url, params=params, timeout=5)
+                print(f"Cleared {len(updates)} pending updates up to ID {last_update_id}")
+            else:
+                print("No pending updates to clear")
+    except Exception as e:
+        print(f"Error clearing pending updates: {e}")
+    
+    # Now start the main polling loop
     while True:
         try:
             # Get updates from Telegram
@@ -488,7 +536,7 @@ def start_command_listener():
             time.sleep(5)  # Wait a bit longer on other errors
 
 def main():
-    print("Minecraft Bedrock Server Telegram Notifier v1.2")
+    print("Minecraft Bedrock Server Telegram Notifier v1.3")
     print("----------------------------------------------")
     
     # Set up server event handlers
