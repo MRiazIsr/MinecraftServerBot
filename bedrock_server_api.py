@@ -7,6 +7,10 @@ import socket
 import threading
 import json
 import logging
+import socket
+import struct
+import random
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -21,6 +25,75 @@ logging.basicConfig(
 )
 
 logger = logging.getLogger("BedrockServerAPI")
+
+class BedrockQuery:
+    """Class to query Minecraft Bedrock servers using the Query protocol"""
+    
+    def __init__(self, host, port=19132, timeout=5.0):
+        """Initialize the query with server details"""
+        self.host = host
+        self.port = port
+        self.timeout = timeout
+        
+    def query_server(self):
+        """Query the server for basic information"""
+        try:
+            # Create UDP socket
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.settimeout(self.timeout)
+            
+            # Send unconnected ping packet
+            ping_time = int(time.time() * 1000)
+            ping_id = random.randint(0, 2**32-1)
+            
+            # Bedrock unconnected ping packet format
+            ping_data = b"\x01" + struct.pack(">Q", ping_time) + bytes.fromhex("00ffff00fefefefefdfdfdfd12345678") + struct.pack(">L", ping_id)
+            
+            # Send and receive
+            sock.sendto(ping_data, (self.host, self.port))
+            response, _ = sock.recvfrom(2048)
+            
+            # Close the socket
+            sock.close()
+            
+            # Check response validity
+            if len(response) <= 35 or response[0] != 0x1C:
+                return None
+            
+            # Parse response
+            data = {}
+            response_str = response[35:].decode('utf-8', errors='ignore')
+            parts = response_str.split(';')
+            
+            if len(parts) < 6:
+                return None
+                
+            # Extract data from response parts
+            try:
+                data["edition"] = parts[0]
+                data["motd"] = parts[1]
+                data["protocol"] = parts[2]
+                data["version"] = parts[3]
+                data["players"] = {
+                    "online": int(parts[4]),
+                    "max": int(parts[5])
+                }
+                data["server_id"] = parts[6] if len(parts) > 6 else ""
+                data["gamemode"] = parts[7] if len(parts) > 7 else ""
+                
+                # For Bedrock server, we can't get player names with just unconnected ping
+                data["players"]["sample"] = []
+                
+                return data
+            except (IndexError, ValueError):
+                return None
+                
+        except socket.timeout:
+            return None
+        except Exception as e:
+            logger.error(f"Error querying server: {e}")
+            return None
+
 
 class BedrockServerAPI:
     """A class to interact with a Minecraft Bedrock server running on the same machine."""
@@ -40,6 +113,7 @@ class BedrockServerAPI:
         self.server_port = server_port
         self.server_process = None
         self.input_pipe = None
+        self.query = BedrockQuery("localhost", server_port)
         self.event_callbacks = {
             'player_join': [],
             'player_leave': [],
@@ -307,18 +381,28 @@ class BedrockServerAPI:
             logger.error(f"Error running command: {e}")
             return False
     
-    def get_online_players(self):
+        def get_online_players(self):
         """Get a list of online players using multiple methods."""
         online_players = []
         
         try:
-            # Method 1: Parse the log file (from your existing code)
+            # Method 1: Try using the query protocol first
+            try:
+                server_info = self.query.query_server()
+                if server_info and "players" in server_info:
+                    # Get player count - we can only get the count, not names
+                    player_count = server_info["players"].get("online", 0)
+                    logger.info(f"Server query reports {player_count} players online")
+            except Exception as e:
+                logger.warning(f"Failed to get players via query protocol: {e}")
+            
+            # Method 2: Parse the log file (this remains our primary method for getting names)
             log_players = self._get_players_from_log()
             if log_players:
                 online_players.extend(log_players)
                 logger.debug(f"Found {len(log_players)} players from log file")
             
-            # Method 2: Try running the 'list' command and capturing output
+            # Method 3: Try running the 'list' command and capturing output
             # This would require more advanced handling to capture command output
             
             # Deduplicate the list

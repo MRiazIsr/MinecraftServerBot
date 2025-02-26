@@ -322,18 +322,44 @@ def handle_telegram_commands(update):
             all_players = list(set(player_list + tracked_players))
             player_count = len(all_players)
             
-            # Create response message
-            response = f"<b>Server Status:</b> {server_status}\n"
-            response += f"<b>Server Type:</b> <code>{SERVER_TYPE}</code>\n"
-            response += f"<b>Server Name:</b> <code>{SERVER_NAME}</code>\n"
-            response += f"<b>Server IP:</b> <code>{SERVER_IP}:{SERVER_PORT}</code>\n"
-            
-            if server_status == "Online ✅":
+            # Try to get more accurate player count via query
+            query_info = server_api.query.query_server()
+            if query_info and "players" in query_info:
+                query_player_count = query_info["players"].get("online", 0)
+                if query_player_count > 0:
+                    # If query reports more players than we know about
+                    if query_player_count > player_count:
+                        player_count = query_player_count
+                        response = f"<b>Server Status:</b> {server_status}\n"
+                        response += f"<b>Server Type:</b> <code>{SERVER_TYPE}</code>\n"
+                        response += f"<b>Server Name:</b> <code>{SERVER_NAME}</code>\n"
+                        response += f"<b>Server IP:</b> <code>{SERVER_IP}:{SERVER_PORT}</code>\n"
+                        response += f"<b>Players Online:</b> {player_count} (names of {len(all_players)} known)\n"
+                    else:
+                        response = f"<b>Server Status:</b> {server_status}\n"
+                        response += f"<b>Server Type:</b> <code>{SERVER_TYPE}</code>\n"
+                        response += f"<b>Server Name:</b> <code>{SERVER_NAME}</code>\n"
+                        response += f"<b>Server IP:</b> <code>{SERVER_IP}:{SERVER_PORT}</code>\n"
+                        response += f"<b>Players Online:</b> {player_count}\n"
+                else:
+                    # Normal response
+                    response = f"<b>Server Status:</b> {server_status}\n"
+                    response += f"<b>Server Type:</b> <code>{SERVER_TYPE}</code>\n"
+                    response += f"<b>Server Name:</b> <code>{SERVER_NAME}</code>\n"
+                    response += f"<b>Server IP:</b> <code>{SERVER_IP}:{SERVER_PORT}</code>\n"
+                    response += f"<b>Players Online:</b> {player_count}\n"
+            else:
+                # Normal response if query fails
+                response = f"<b>Server Status:</b> {server_status}\n"
+                response += f"<b>Server Type:</b> <code>{SERVER_TYPE}</code>\n"
+                response += f"<b>Server Name:</b> <code>{SERVER_NAME}</code>\n"
+                response += f"<b>Server IP:</b> <code>{SERVER_IP}:{SERVER_PORT}</code>\n"
                 response += f"<b>Players Online:</b> {player_count}\n"
-                if player_count > 0:
-                    response += "\n<b>Players:</b>\n"
-                    for player in sorted(all_players):
-                        response += f"• {player}\n"
+            
+            if server_status == "Online ✅" and player_count > 0 and all_players:
+                response += "\n<b>Players:</b>\n"
+                for player in sorted(all_players):
+                    response += f"• {player}\n"
             
             # Send the response (force bypass cooldown for commands)
             send_telegram_message(response, chat_id, force=True)
