@@ -381,7 +381,7 @@ class BedrockServerAPI:
             logger.error(f"Error running command: {e}")
             return False
     
-        def get_online_players(self):
+    def get_online_players(self):
         """Get a list of online players using multiple methods."""
         online_players = []
         
