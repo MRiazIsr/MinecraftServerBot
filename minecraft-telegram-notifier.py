@@ -9,6 +9,38 @@ from datetime import datetime
 import json
 import threading
 
+# Add a startup delay to prevent rapid restarts
+print("Starting bot with 10-second startup delay to prevent restart loops...")
+time.sleep(10)
+
+# Create a marker file to track restarts
+restart_marker_file = "/tmp/minecraft_bot_restart_count"
+MAX_RESTARTS_PER_HOUR = 5
+
+def check_restart_limit():
+    """Check if we've restarted too many times recently"""
+    try:
+        current_time = int(time.time())
+        one_hour_ago = current_time - 3600
+        
+        if os.path.exists(restart_marker_file):
+            with open(restart_marker_file, 'r') as f:
+                restarts = [int(line.strip()) for line in f if line.strip()]
+                # Filter to only include restarts in the last hour
+                recent_restarts = [t for t in restarts if t > one_hour_ago]
+                if len(recent_restarts) >= MAX_RESTARTS_PER_HOUR:
+                    print(f"WARNING: {len(recent_restarts)} restarts in the last hour, exceeding limit of {MAX_RESTARTS_PER_HOUR}")
+                    return False
+        
+        # Add this restart to the log
+        with open(restart_marker_file, 'a') as f:
+            f.write(f"{current_time}\n")
+        
+        return True
+    except Exception as e:
+        print(f"Error checking restart limit: {e}")
+        return True  # Default to allowing restart if we can't check
+
 # Add error handling for import
 try:
     from bedrock_server_api import BedrockServerAPI
@@ -19,15 +51,15 @@ except ImportError as e:
     print("Files in directory:", os.listdir('.'))
     sys.exit(1)
 
-# Configuration - Read from environment variables
+# Configuration - Read from environment variables with defaults
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
-SERVER_LOG_PATH = os.path.join(os.getcwd(), "logs.txt")  # Use current directory
-SERVER_PATH = os.getcwd()  # Use current directory
-SERVER_IP = os.environ.get("SERVER_IP", "127.0.0.1")  # Your server's public IP
-SERVER_PORT = int(os.environ.get("SERVER_PORT", "19132"))  # Default Bedrock port
-SERVER_TYPE = 'Bedrock'
-SERVER_NAME = 'Super Massive Black Hole'
+SERVER_LOG_PATH = os.environ.get("SERVER_LOG_PATH", os.path.join(os.getcwd(), "logs.txt"))
+SERVER_PATH = os.environ.get("SERVER_PATH", os.getcwd())
+SERVER_IP = os.environ.get("SERVER_IP", "127.0.0.1")
+SERVER_PORT = int(os.environ.get("SERVER_PORT", "19132"))
+SERVER_TYPE = os.environ.get("SERVER_TYPE", 'Bedrock')
+SERVER_NAME = os.environ.get("SERVER_NAME", 'Super Massive Black Hole')
 
 # Track active players to prevent duplicate notifications
 active_players = set()
@@ -53,8 +85,9 @@ if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
 else:
     NOTIFICATIONS_ENABLED = True
 
-# Initialize the server API
+# Initialize the server API with proper error handling
 try:
+    print("Initializing server API...")
     server_api = BedrockServerAPI(
         server_path=SERVER_PATH,
         log_path=SERVER_LOG_PATH,
@@ -63,6 +96,22 @@ try:
     print("Server API initialized successfully")
 except Exception as e:
     print(f"ERROR: Failed to initialize server API: {e}")
+    # Don't exit immediately - try to send error notification
+    error_msg = f"⚠️ Failed to initialize server API: {str(e)}"
+    
+    # Try to send error message directly
+    if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
+        try:
+            api_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+            requests.post(api_url, data={
+                "chat_id": TELEGRAM_CHAT_ID,
+                "text": error_msg,
+                "parse_mode": "HTML"
+            }, timeout=10)
+        except Exception:
+            pass
+    
+    # Exit with error
     sys.exit(1)
 
 def is_message_on_cooldown(message_key, message_type="default"):
@@ -108,7 +157,7 @@ def send_telegram_message(message, chat_id=None, force=False):
     }
     
     try:
-        response = requests.post(api_url, data=data)
+        response = requests.post(api_url, data=data, timeout=10)
         if response.status_code != 200:
             print(f"Failed to send Telegram message: {response.text}")
             return False
@@ -118,6 +167,115 @@ def send_telegram_message(message, chat_id=None, force=False):
     except Exception as e:
         print(f"Error sending Telegram message: {e}")
         return False
+
+def handle_player_join(data):
+    """Handle player join event with improved tracking"""
+    try:
+        player_name = data['player']
+        
+        # Thread-safe update of active players
+        with player_lock:
+            # Check if this player is already tracked to avoid duplicate notifications
+            if player_name not in active_players:
+                active_players.add(player_name)
+                # Only send a message if this is a new player
+                send_telegram_message(f"🎮 Player {player_name} has joined the Minecraft server!")
+                print(f"Player joined (new): {player_name}")
+            else:
+                print(f"Player join event for already tracked player: {player_name}")
+    except Exception as e:
+        print(f"Error handling player join: {e}")
+
+def handle_player_leave(data):
+    """Handle player leave event with improved tracking"""
+    try:
+        player_name = data['player']
+        
+        # Thread-safe update of active players
+        with player_lock:
+            if player_name in active_players:
+                active_players.remove(player_name)
+                send_telegram_message(f"👋 Player {player_name} has left the Minecraft server")
+                print(f"Player left: {player_name}")
+            else:
+                print(f"Player leave event for untracked player: {player_name}")
+    except Exception as e:
+        print(f"Error handling player leave: {e}")
+
+def handle_chat_message(data):
+    """Handle chat message event"""
+    try:
+        send_telegram_message(f"💬 <b>{data['player']}</b>: {data['message']}")
+    except Exception as e:
+        print(f"Error handling chat message: {e}")
+
+def handle_server_start(data):
+    """Handle server start event"""
+    try:
+        send_telegram_message("🟢 Minecraft server has started")
+    except Exception as e:
+        print(f"Error handling server start: {e}")
+
+def handle_server_stop(data):
+    """Handle server stop event"""
+    try:
+        send_telegram_message("🔴 Minecraft server has stopped")
+    except Exception as e:
+        print(f"Error handling server stop: {e}")
+
+def setup_server_event_handlers():
+    """Set up handlers for server events."""
+    try:
+        # Player join event
+        server_api.on('player_join', handle_player_join)
+        
+        # Player leave event
+        server_api.on('player_leave', handle_player_leave)
+        
+        # Chat message event
+        server_api.on('chat_message', handle_chat_message)
+        
+        # Server start event
+        server_api.on('server_start', handle_server_start)
+        
+        # Server stop event
+        server_api.on('server_stop', handle_server_stop)
+        
+        print("Server event handlers set up successfully")
+    except Exception as e:
+        print(f"Error setting up event handlers: {e}")
+
+def sync_player_list():
+    """Periodically sync the player list with the server to ensure accuracy"""
+    while True:
+        try:
+            # Skip if server is not running
+            if not server_api.is_server_running():
+                time.sleep(60)  # Wait a minute before checking again
+                continue
+                
+            # Get current players from server
+            server_players = server_api.get_online_players()
+            
+            with player_lock:
+                # Players that are in our tracking but not on server
+                for player in list(active_players):
+                    if player not in server_players:
+                        print(f"Removing player not on server: {player}")
+                        active_players.remove(player)
+                
+                # Players on server but not in our tracking
+                for player in server_players:
+                    if player not in active_players:
+                        print(f"Adding missing player from server: {player}")
+                        active_players.add(player)
+                        # We don't send a notification here to avoid spam
+            
+        except Exception as e:
+            print(f"Error syncing player list: {e}")
+        
+        # Sleep for 5 minutes before next sync
+        time.sleep(300)
 
 def handle_telegram_commands(update):
     """Handle incoming Telegram commands."""
@@ -223,10 +381,14 @@ def handle_telegram_commands(update):
                         
         # Handle /restart command (restart the bot)
         elif text.startswith("/restart"):
-            send_telegram_message("🔄 Restarting the notification bot...", chat_id, force=True)
-            print("Restart command received, exiting process...")
-            # The systemd service will restart the bot
-            os._exit(0)
+            # Check if we've restarted too many times recently
+            if check_restart_limit():
+                send_telegram_message("🔄 Restarting the notification bot...", chat_id, force=True)
+                print("Restart command received, exiting process...")
+                # The systemd service will restart the bot
+                sys.exit(0)
+            else:
+                send_telegram_message("⚠️ Too many restarts in the last hour. Please wait before restarting again.", chat_id, force=True)
             
         # Handle /debug command
         elif text.startswith("/debug"):
@@ -234,9 +396,20 @@ def handle_telegram_commands(update):
                 tracked_player_count = len(active_players)
                 player_list = list(active_players)
             
+            # Check if restart marker file exists
+            restart_count = 0
+            if os.path.exists(restart_marker_file):
+                try:
+                    with open(restart_marker_file, 'r') as f:
+                        restarts = [int(line.strip()) for line in f if line.strip()]
+                        one_hour_ago = int(time.time()) - 3600
+                        restart_count = len([t for t in restarts if t > one_hour_ago])
+                except Exception:
+                    pass
+            
             debug_info = f"""
 <b>Debug Information:</b>
-• <b>Bot Version:</b> 1.1
+• <b>Bot Version:</b> 1.2
 • <b>Server Path:</b> <code>{SERVER_PATH}</code>
 • <b>Log Path:</b> <code>{SERVER_LOG_PATH}</code>
 • <b>Server IP:</b> <code>{SERVER_IP}</code>
@@ -249,6 +422,7 @@ def handle_telegram_commands(update):
 • <b>Tracked Player Count:</b> {tracked_player_count}
 • <b>Tracked Players:</b> {', '.join(player_list) if player_list else 'None'}
 • <b>Active Message Cooldowns:</b> {len(last_message_time)}
+• <b>Restarts in Last Hour:</b> {restart_count}
 """
             send_telegram_message(debug_info, chat_id, force=True)
             print(f"Responded to /debug command from chat {chat_id}")
@@ -268,6 +442,10 @@ def start_command_listener():
     
     print("Starting Telegram command listener...")
     
+    # Exponential backoff parameters
+    max_retry_delay = 300  # Maximum retry delay in seconds (5 minutes)
+    retry_delay = 1  # Start with 1 second delay
+    
     while True:
         try:
             # Get updates from Telegram
@@ -277,8 +455,11 @@ def start_command_listener():
                 "timeout": 30
             }
             
-            response = requests.get(api_url, params=params)
+            response = requests.get(api_url, params=params, timeout=35)
             if response.status_code == 200:
+                # Reset retry delay on success
+                retry_delay = 1
+                
                 updates = response.json().get("result", [])
                 
                 for update in updates:
@@ -288,98 +469,26 @@ def start_command_listener():
                     
                     # Handle commands
                     handle_telegram_commands(update)
+            else:
+                print(f"Error from Telegram API: {response.status_code} - {response.text}")
+                # Implement exponential backoff
+                time.sleep(retry_delay)
+                retry_delay = min(retry_delay * 2, max_retry_delay)
             
             time.sleep(1)  # Small delay to avoid hammering the API
         
+        except requests.exceptions.RequestException as e:
+            print(f"Network error in command listener: {e}")
+            # Implement exponential backoff for network errors
+            time.sleep(retry_delay)
+            retry_delay = min(retry_delay * 2, max_retry_delay)
+        
         except Exception as e:
             print(f"Error in command listener: {e}")
-            time.sleep(5)  # Wait a bit longer on error
-
-def handle_player_join(data):
-    """Handle player join event with improved tracking"""
-    player_name = data['player']
-    
-    # Thread-safe update of active players
-    with player_lock:
-        # Check if this player is already tracked to avoid duplicate notifications
-        if player_name not in active_players:
-            active_players.add(player_name)
-            # Only send a message if this is a new player
-            send_telegram_message(f"🎮 Player {player_name} has joined the Minecraft server!")
-            print(f"Player joined (new): {player_name}")
-        else:
-            print(f"Player join event for already tracked player: {player_name}")
-
-def handle_player_leave(data):
-    """Handle player leave event with improved tracking"""
-    player_name = data['player']
-    
-    # Thread-safe update of active players
-    with player_lock:
-        if player_name in active_players:
-            active_players.remove(player_name)
-            send_telegram_message(f"👋 Player {player_name} has left the Minecraft server")
-            print(f"Player left: {player_name}")
-        else:
-            print(f"Player leave event for untracked player: {player_name}")
-
-def setup_server_event_handlers():
-    """Set up handlers for server events."""
-    try:
-        # Player join event
-        server_api.on('player_join', handle_player_join)
-        
-        # Player leave event
-        server_api.on('player_leave', handle_player_leave)
-        
-        # Chat message event
-        server_api.on('chat_message', lambda data: 
-            send_telegram_message(f"💬 <b>{data['player']}</b>: {data['message']}")
-        )
-        
-        # Server start event
-        server_api.on('server_start', lambda data: 
-            send_telegram_message("🟢 Minecraft server has started")
-        )
-        
-        # Server stop event
-        server_api.on('server_stop', lambda data: 
-            send_telegram_message("🔴 Minecraft server has stopped")
-        )
-        
-        print("Server event handlers set up successfully")
-    except Exception as e:
-        print(f"Error setting up event handlers: {e}")
-
-def sync_player_list():
-    """Periodically sync the player list with the server to ensure accuracy"""
-    while True:
-        try:
-            # Get current players from server
-            server_players = server_api.get_online_players()
-            
-            with player_lock:
-                # Players that are in our tracking but not on server
-                for player in list(active_players):
-                    if player not in server_players:
-                        print(f"Removing player not on server: {player}")
-                        active_players.remove(player)
-                
-                # Players on server but not in our tracking
-                for player in server_players:
-                    if player not in active_players:
-                        print(f"Adding missing player from server: {player}")
-                        active_players.add(player)
-                        # We don't send a notification here to avoid spam
-            
-        except Exception as e:
-            print(f"Error syncing player list: {e}")
-        
-        # Sleep for 5 minutes before next sync
-        time.sleep(300)
+            time.sleep(5)  # Wait a bit longer on other errors
 
 def main():
-    print("Minecraft Bedrock Server Telegram Notifier v1.1")
+    print("Minecraft Bedrock Server Telegram Notifier v1.2")
     print("----------------------------------------------")
     
     # Set up server event handlers
@@ -396,10 +505,13 @@ def main():
     
     # Initialize the player list with currently online players
     try:
-        online_players = server_api.get_online_players()
-        with player_lock:
-            active_players.update(online_players)
-        print(f"Initialized player list with {len(online_players)} player(s)")
+        if server_api.is_server_running():
+            online_players = server_api.get_online_players()
+            with player_lock:
+                active_players.update(online_players)
+            print(f"Initialized player list with {len(online_players)} player(s)")
+        else:
+            print("Server not running, skipping player list initialization")
     except Exception as e:
         print(f"Error initializing player list: {e}")
     
@@ -419,14 +531,22 @@ def main():
         # Register signal handlers for graceful shutdown
         def handle_exit(signum, frame):
             print(f"\nReceived signal {signum}, shutting down...")
-            send_telegram_message("🔄 Minecraft notification bot is shutting down", force=True)
+            try:
+                send_telegram_message("🔄 Minecraft notification bot is shutting down", force=True)
+            except:
+                pass
             sys.exit(0)
             
         signal.signal(signal.SIGINT, handle_exit)
         signal.signal(signal.SIGTERM, handle_exit)
         
         # Start command listener in the main thread
-        start_command_listener()
+        try:
+            start_command_listener()
+        except Exception as e:
+            print(f"Fatal error in command listener: {e}")
+            send_telegram_message(f"⚠️ Fatal error: {str(e)}", force=True)
+            sys.exit(1)
     else:
         print("Telegram notifications disabled. Running in monitoring mode only.")
         # Just keep the script alive to monitor events
@@ -437,4 +557,22 @@ def main():
             print("\nShutting down notification system...")
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        # Last resort error handling
+        print(f"FATAL ERROR: {e}")
+        
+        # Try to send error notification before exiting
+        if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
+            try:
+                api_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+                requests.post(api_url, data={
+                    "chat_id": TELEGRAM_CHAT_ID,
+                    "text": f"⚠️ Bot crashed with error: {str(e)}",
+                    "parse_mode": "HTML"
+                }, timeout=10)
+            except:
+                pass
+            
+        sys.exit(1)
