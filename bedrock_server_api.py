@@ -393,6 +393,7 @@ class BedrockServerAPI:
                     # Get player count - we can only get the count, not names
                     player_count = server_info["players"].get("online", 0)
                     logger.info(f"Server query reports {player_count} players online")
+                    return server_info["players"].get("sample", [])
             except Exception as e:
                 logger.warning(f"Failed to get players via query protocol: {e}")
             
